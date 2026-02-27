@@ -1,0 +1,27 @@
+{
+  "name": "@corvid-agent/queue",
+  "version": "1.0.0",
+  "description": "Async task queue with concurrency control, priority, pause/resume, and backpressure",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": ["queue", "async", "concurrency", "priority-queue", "task-queue", "backpressure", "typescript"],
+  "author": "corvid-agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/corvid-agent/queue.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/bun": "latest"
+  }
+}

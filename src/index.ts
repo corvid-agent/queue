@@ -21,6 +21,12 @@ export interface TaskOptions {
   priority?: number;
   /** AbortSignal to cancel this task */
   signal?: AbortSignal;
+  /** Timeout in milliseconds — rejects with TaskTimeoutError if exceeded */
+  timeout?: number;
+  /** Number of retry attempts on failure (default: 0) */
+  retries?: number;
+  /** Delay between retries in ms, or a function for custom backoff (default: 0) */
+  retryDelay?: number | ((attempt: number) => number);
 }
 
 export type TaskFunction<T> = () => Promise<T> | T;
@@ -55,14 +61,41 @@ export class TaskAbortedError extends Error {
   }
 }
 
+export class TaskTimeoutError extends Error {
+  readonly timeout: number;
+
+  constructor(timeout: number) {
+    super(`Task timed out after ${timeout}ms`);
+    this.name = "TaskTimeoutError";
+    this.timeout = timeout;
+  }
+}
+
 // ── Internal Types ─────────────────────────────────────────────────────
 
 interface QueueEntry<T> {
   fn: TaskFunction<T>;
   priority: number;
   signal?: AbortSignal;
+  timeout?: number;
+  retries: number;
+  retryDelay: number | ((attempt: number) => number);
   resolve: (value: T) => void;
   reject: (reason: unknown) => void;
+}
+
+/** Cumulative queue statistics */
+export interface QueueStats {
+  /** Total tasks that have finished (success + failure) */
+  processed: number;
+  /** Tasks that completed successfully */
+  succeeded: number;
+  /** Tasks that failed (after all retries exhausted) */
+  failed: number;
+  /** Total retry attempts across all tasks */
+  retries: number;
+  /** Tasks that timed out (subset of failed) */
+  timedOut: number;
 }
 
 // ── Queue ──────────────────────────────────────────────────────────────
@@ -87,6 +120,7 @@ export class Queue {
   private running = 0;
   private paused: boolean;
   private listeners = new Map<EventName, Set<Function>>();
+  private _stats: QueueStats = { processed: 0, succeeded: 0, failed: 0, retries: 0, timedOut: 0 };
 
   readonly concurrency: number;
   readonly maxSize: number;
@@ -112,7 +146,7 @@ export class Queue {
    * ```
    */
   add<T>(fn: TaskFunction<T>, options: TaskOptions = {}): Promise<T> {
-    const { priority = 0, signal } = options;
+    const { priority = 0, signal, timeout, retries = 0, retryDelay = 0 } = options;
 
     // Check if already aborted
     if (signal?.aborted) {
@@ -125,7 +159,7 @@ export class Queue {
     }
 
     return new Promise<T>((resolve, reject) => {
-      const entry: QueueEntry<T> = { fn, priority, signal, resolve, reject };
+      const entry: QueueEntry<T> = { fn, priority, signal, timeout, retries, retryDelay, resolve, reject };
 
       // Handle abort while queued
       if (signal) {
@@ -245,6 +279,16 @@ export class Queue {
     return this.running === 0 && this.pending.length === 0;
   }
 
+  /** Cumulative statistics for this queue */
+  get stats(): Readonly<QueueStats> {
+    return { ...this._stats };
+  }
+
+  /** Reset all statistics to zero */
+  resetStats(): void {
+    this._stats = { processed: 0, succeeded: 0, failed: 0, retries: 0, timedOut: 0 };
+  }
+
   // ── Events ─────────────────────────────────────────────────────────
 
   /**
@@ -312,31 +356,90 @@ export class Queue {
   }
 
   private async run<T>(entry: QueueEntry<T>): Promise<void> {
-    try {
-      const result = await entry.fn();
+    let lastError: unknown;
 
-      // Check if aborted during execution
+    for (let attempt = 0; attempt <= entry.retries; attempt++) {
+      // Wait before retry (not before first attempt)
+      if (attempt > 0) {
+        this._stats.retries++;
+        const delay = typeof entry.retryDelay === "function"
+          ? entry.retryDelay(attempt)
+          : entry.retryDelay;
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      }
+
+      // Check abort before each attempt
       if (entry.signal?.aborted) {
+        this._stats.processed++;
+        this._stats.failed++;
         entry.reject(new TaskAbortedError(entry.signal.reason));
-      } else {
+        this.finish();
+        return;
+      }
+
+      try {
+        const result = await this.executeWithTimeout(entry.fn, entry.timeout);
+
+        // Check if aborted during execution
+        if (entry.signal?.aborted) {
+          this._stats.processed++;
+          this._stats.failed++;
+          entry.reject(new TaskAbortedError(entry.signal.reason));
+          this.finish();
+          return;
+        }
+
+        this._stats.processed++;
+        this._stats.succeeded++;
         entry.resolve(result);
         this.emit("completed", result, entry.fn);
-      }
-    } catch (error) {
-      entry.reject(error);
-      this.emit("error", error instanceof Error ? error : new Error(String(error)), entry.fn);
-    } finally {
-      this.running--;
+        this.finish();
+        return;
+      } catch (error) {
+        lastError = error;
 
-      if (this.running === 0 && this.pending.length === 0) {
-        this.emit("idle");
-        this.emit("drained");
+        // Don't retry timeouts or aborts
+        if (error instanceof TaskTimeoutError || error instanceof TaskAbortedError) {
+          break;
+        }
       }
+    }
 
-      // Process next
-      if (!this.paused) {
-        this.process();
-      }
+    // All attempts exhausted
+    this._stats.processed++;
+    this._stats.failed++;
+    if (lastError instanceof TaskTimeoutError) {
+      this._stats.timedOut++;
+    }
+    entry.reject(lastError);
+    this.emit("error", lastError instanceof Error ? lastError : new Error(String(lastError)), entry.fn);
+    this.finish();
+  }
+
+  private executeWithTimeout<T>(fn: TaskFunction<T>, timeout?: number): Promise<T> {
+    const task = Promise.resolve().then(fn);
+    if (!timeout) return task;
+
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new TaskTimeoutError(timeout)), timeout);
+      task.then(
+        (v) => { clearTimeout(timer); resolve(v); },
+        (e) => { clearTimeout(timer); reject(e); },
+      );
+    });
+  }
+
+  private finish(): void {
+    this.running--;
+
+    if (this.running === 0 && this.pending.length === 0) {
+      this.emit("idle");
+      this.emit("drained");
+    }
+
+    // Process next
+    if (!this.paused) {
+      this.process();
     }
   }
 }

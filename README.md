@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/@corvid-agent/queue)](https://www.npmjs.com/package/@corvid-agent/queue)
 ![zero deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 
-Async task queue with concurrency control, priority, pause/resume, and backpressure. Zero dependencies. TypeScript-first.
+Async task queue with concurrency control, priority, pause/resume, backpressure, timeout, retry, and stats. Zero dependencies. TypeScript-first.
 
 ## Install
 
@@ -90,6 +90,57 @@ const promise = queue.add(() => fetchData(), {
 controller.abort(); // removes from queue, rejects with TaskAbortedError
 ```
 
+### Timeout
+
+Reject tasks that take too long:
+
+```ts
+import { TaskTimeoutError } from "@corvid-agent/queue";
+
+try {
+  await queue.add(() => slowOperation(), { timeout: 5000 });
+} catch (err) {
+  if (err instanceof TaskTimeoutError) {
+    console.log(`Timed out after ${err.timeout}ms`);
+  }
+}
+```
+
+### Retry
+
+Automatically retry failed tasks with optional backoff:
+
+```ts
+// Constant delay between retries
+await queue.add(() => flakeyApi(), {
+  retries: 3,
+  retryDelay: 1000,
+});
+
+// Exponential backoff: 100ms, 200ms, 400ms
+await queue.add(() => flakeyApi(), {
+  retries: 3,
+  retryDelay: (attempt) => 100 * Math.pow(2, attempt - 1),
+});
+```
+
+Timeouts and aborts are **not retried** — only thrown errors trigger retries.
+
+### Stats
+
+Track cumulative queue performance:
+
+```ts
+const queue = new Queue({ concurrency: 5 });
+
+// ... process tasks ...
+
+console.log(queue.stats);
+// { processed: 100, succeeded: 95, failed: 5, retries: 12, timedOut: 2 }
+
+queue.resetStats(); // reset all counters
+```
+
 ### Events
 
 ```ts
@@ -143,6 +194,9 @@ const alive = await filter(servers, async (server) => {
 |--------|------|---------|-------------|
 | `priority` | `number` | `0` | Higher = runs first |
 | `signal` | `AbortSignal` | - | Cancel the task |
+| `timeout` | `number` | - | Reject after ms with `TaskTimeoutError` |
+| `retries` | `number` | `0` | Retry attempts on failure |
+| `retryDelay` | `number \| (attempt) => number` | `0` | Delay between retries (ms) |
 
 ### Properties
 
@@ -152,6 +206,7 @@ const alive = await filter(servers, async (server) => {
 | `queue.active` | `number` | Running tasks |
 | `queue.isPaused` | `boolean` | Whether paused |
 | `queue.isIdle` | `boolean` | Nothing running or pending |
+| `queue.stats` | `QueueStats` | Cumulative { processed, succeeded, failed, retries, timedOut } |
 
 ### Methods
 
@@ -167,6 +222,7 @@ const alive = await filter(servers, async (server) => {
 | `onDrained()` | Wait until all processed |
 | `on(event, listener)` | Add event listener |
 | `off(event, listener)` | Remove event listener |
+| `resetStats()` | Reset all statistics to zero |
 
 ### `map(items, fn, options?)`
 
@@ -184,6 +240,7 @@ Concurrent filter preserving order.
 
 - `QueueFullError` — thrown when `maxSize` is exceeded
 - `TaskAbortedError` — thrown when a task is aborted or queue is cleared
+- `TaskTimeoutError` — thrown when a task exceeds its `timeout`
 
 ## License
 

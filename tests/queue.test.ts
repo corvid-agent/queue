@@ -3,6 +3,7 @@ import {
   Queue,
   QueueFullError,
   TaskAbortedError,
+  TaskTimeoutError,
   map,
   each,
   filter,
@@ -518,5 +519,218 @@ describe("filter", () => {
       { concurrency: 5 },
     );
     expect(result).toEqual([5, 3, 4]);
+  });
+});
+
+// ── Timeout ──────────────────────────────────────────────────────────
+
+describe("timeout", () => {
+  test("rejects with TaskTimeoutError when task exceeds timeout", async () => {
+    const queue = new Queue();
+    try {
+      await queue.add(() => wait(200), { timeout: 20 });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err).toBeInstanceOf(TaskTimeoutError);
+      expect((err as TaskTimeoutError).timeout).toBe(20);
+    }
+  });
+
+  test("succeeds when task completes within timeout", async () => {
+    const queue = new Queue();
+    const result = await queue.add(async () => {
+      await wait(5);
+      return "fast";
+    }, { timeout: 200 });
+    expect(result).toBe("fast");
+  });
+
+  test("timeout does not affect tasks without timeout option", async () => {
+    const queue = new Queue();
+    const result = await queue.add(async () => {
+      await wait(30);
+      return "no-timeout";
+    });
+    expect(result).toBe("no-timeout");
+  });
+
+  test("timed out tasks are tracked in stats", async () => {
+    const queue = new Queue();
+    try { await queue.add(() => wait(200), { timeout: 10 }); } catch {}
+    expect(queue.stats.timedOut).toBe(1);
+    expect(queue.stats.failed).toBe(1);
+  });
+});
+
+// ── Retry ────────────────────────────────────────────────────────────
+
+describe("retry", () => {
+  test("retries on failure up to specified count", async () => {
+    const queue = new Queue();
+    let attempts = 0;
+
+    const result = await queue.add(async () => {
+      attempts++;
+      if (attempts < 3) throw new Error("not yet");
+      return "success";
+    }, { retries: 3 });
+
+    expect(result).toBe("success");
+    expect(attempts).toBe(3);
+  });
+
+  test("rejects after all retries exhausted", async () => {
+    const queue = new Queue();
+    let attempts = 0;
+
+    try {
+      await queue.add(async () => {
+        attempts++;
+        throw new Error("always fail");
+      }, { retries: 2 });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect((err as Error).message).toBe("always fail");
+    }
+
+    // 1 initial + 2 retries = 3
+    expect(attempts).toBe(3);
+  });
+
+  test("applies constant retryDelay between attempts", async () => {
+    const queue = new Queue();
+    const times: number[] = [];
+
+    try {
+      await queue.add(async () => {
+        times.push(Date.now());
+        throw new Error("fail");
+      }, { retries: 2, retryDelay: 30 });
+    } catch {}
+
+    expect(times.length).toBe(3);
+    // Each gap should be ~30ms
+    for (let i = 1; i < times.length; i++) {
+      expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(20);
+    }
+  });
+
+  test("applies custom backoff function", async () => {
+    const queue = new Queue();
+    const times: number[] = [];
+
+    try {
+      await queue.add(async () => {
+        times.push(Date.now());
+        throw new Error("fail");
+      }, { retries: 2, retryDelay: (attempt) => attempt * 20 });
+    } catch {}
+
+    expect(times.length).toBe(3);
+    // First retry: 20ms, second retry: 40ms
+    expect(times[1] - times[0]).toBeGreaterThanOrEqual(15);
+    expect(times[2] - times[1]).toBeGreaterThanOrEqual(30);
+  });
+
+  test("does not retry on timeout", async () => {
+    const queue = new Queue();
+    let attempts = 0;
+
+    try {
+      await queue.add(async () => {
+        attempts++;
+        await wait(200);
+      }, { timeout: 10, retries: 3 });
+    } catch (err) {
+      expect(err).toBeInstanceOf(TaskTimeoutError);
+    }
+
+    expect(attempts).toBe(1);
+  });
+
+  test("does not retry on abort", async () => {
+    const queue = new Queue();
+    const controller = new AbortController();
+    let attempts = 0;
+
+    setTimeout(() => controller.abort(), 10);
+
+    try {
+      await queue.add(async () => {
+        attempts++;
+        await wait(50);
+      }, { signal: controller.signal, retries: 3 });
+    } catch (err) {
+      expect(err).toBeInstanceOf(TaskAbortedError);
+    }
+
+    // Only one attempt — abort during execution stops retries
+    expect(attempts).toBe(1);
+  });
+
+  test("retries are tracked in stats", async () => {
+    const queue = new Queue();
+    let attempts = 0;
+
+    await queue.add(async () => {
+      attempts++;
+      if (attempts < 3) throw new Error("not yet");
+      return "ok";
+    }, { retries: 3 });
+
+    expect(queue.stats.retries).toBe(2);
+    expect(queue.stats.succeeded).toBe(1);
+  });
+});
+
+// ── Stats ────────────────────────────────────────────────────────────
+
+describe("stats", () => {
+  test("tracks processed, succeeded, and failed counts", async () => {
+    const queue = new Queue({ concurrency: 2 });
+
+    await queue.add(() => "ok");
+    await queue.add(() => "ok2");
+    try { await queue.add(() => { throw new Error("boom"); }); } catch {}
+
+    expect(queue.stats.processed).toBe(3);
+    expect(queue.stats.succeeded).toBe(2);
+    expect(queue.stats.failed).toBe(1);
+  });
+
+  test("stats are cumulative across tasks", async () => {
+    const queue = new Queue();
+
+    for (let i = 0; i < 5; i++) {
+      await queue.add(() => i);
+    }
+
+    expect(queue.stats.processed).toBe(5);
+    expect(queue.stats.succeeded).toBe(5);
+    expect(queue.stats.failed).toBe(0);
+  });
+
+  test("resetStats clears all counters", async () => {
+    const queue = new Queue();
+    await queue.add(() => "ok");
+    try { await queue.add(() => { throw new Error("fail"); }); } catch {}
+
+    expect(queue.stats.processed).toBe(2);
+
+    queue.resetStats();
+
+    expect(queue.stats.processed).toBe(0);
+    expect(queue.stats.succeeded).toBe(0);
+    expect(queue.stats.failed).toBe(0);
+    expect(queue.stats.retries).toBe(0);
+    expect(queue.stats.timedOut).toBe(0);
+  });
+
+  test("stats returns a snapshot (not a live reference)", async () => {
+    const queue = new Queue();
+    const before = queue.stats;
+    await queue.add(() => "ok");
+    expect(before.processed).toBe(0);
+    expect(queue.stats.processed).toBe(1);
   });
 });
